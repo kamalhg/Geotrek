@@ -1,12 +1,24 @@
+(function () {
+
 L.Handler.MarkerSnap = L.Handler.extend({
-    statics: {
-        SNAP_DISTANCE: 15  // in pixels
+    options: {
+        snapDistance: 15, // in pixels
+        snapVertices: true
     },
 
-    initialize: function (map, marker) {
+    initialize: function (map, marker, options) {
         L.Handler.prototype.initialize.call(this, map);
         this._markers = [];
         this._guides = [];
+
+        if (arguments.length == 2) {
+            if (!(marker instanceof L.Class)) {
+                options = marker;
+                marker = null;
+            }
+        }
+
+        L.Util.setOptions(this, options || {});
 
         if (marker) {
             // new markers should be draggable !
@@ -15,15 +27,15 @@ L.Handler.MarkerSnap = L.Handler.extend({
             this.watchMarker(marker);
         }
 
-        // Convert SNAP_DISTANCE in pixels into buffer in degres, for searching around mouse
+        // Convert snap distance in pixels into buffer in degres, for searching around mouse
         // It changes at each zoom change.
         function computeBuffer() {
             this._buffer = map.layerPointToLatLng(new L.Point(0,0)).lat -
-                           map.layerPointToLatLng(new L.Point(L.Handler.MarkerSnap.SNAP_DISTANCE, 0)).lat;
+                           map.layerPointToLatLng(new L.Point(this.options.snapDistance, 0)).lat;
         }
         map.on('zoomend', computeBuffer, this);
         map.whenReady(computeBuffer, this);
-        computeBuffer();
+        computeBuffer.call(this);
     },
 
     enable: function () {
@@ -46,31 +58,31 @@ L.Handler.MarkerSnap = L.Handler.extend({
     },
 
     unwatchMarker: function (marker) {
-        marker.off('move', this._snapMarker);
+        marker.off('move', this._snapMarker, this);
         delete marker['snap'];
     },
 
     addGuideLayer: function (layer) {
-        if ((typeof layer._layers !== undefined) &&
-            (typeof layer.searchBuffer !== 'function')) {
-            // Guide is a layer group and has no L.LayerIndexMixin (from Leaflet.LayerIndex)
-            for (var id in layer._layers) {
-                this.addGuideLayer(layer._layers[id]);
-            }
-        }
-        else {
-            this._guides.push(layer);
-        }
+        for (var i=0, n=this._guides.length; i<n; i++)
+            if (L.stamp(layer) === L.stamp(this._guides[i]))
+                return;
+        this._guides.push(layer);
     },
 
     _snapMarker: function(e) {
         var marker = e.target,
             latlng = marker.getLatLng(),
             snaplist = [];
-        for (var i=0, n = this._guides.length; i < n; i++) {
-            var guide = this._guides[i];
 
-            if (typeof guide.searchBuffer === 'function') {
+        function processGuide(guide) {
+            if ((guide._layers !== undefined) &&
+                (typeof guide.searchBuffer !== 'function')) {
+                // Guide is a layer group and has no L.LayerIndexMixin (from Leaflet.LayerIndex)
+                for (var id in guide._layers) {
+                    processGuide(guide._layers[id]);
+                }
+            }
+            else if (typeof guide.searchBuffer === 'function') {
                 // Search snaplist around mouse
                 snaplist = snaplist.concat(guide.searchBuffer(latlng, this._buffer));
             }
@@ -78,7 +90,17 @@ L.Handler.MarkerSnap = L.Handler.extend({
                 snaplist.push(guide);
             }
         }
-        var closest = L.GeometryUtil.closestLayerSnap(this._map, snaplist, latlng, L.Handler.MarkerSnap.SNAP_DISTANCE, true);
+
+        for (var i=0, n = this._guides.length; i < n; i++) {
+            var guide = this._guides[i];
+            processGuide.call(this, guide);
+        }
+
+        var closest = L.GeometryUtil.closestLayerSnap(this._map,
+                                                      snaplist,
+                                                      latlng,
+                                                      this.options.snapDistance,
+                                                      this.options.snapVertices);
         closest = closest || {layer: null, latlng: null};
         this._updateSnap(marker, closest.layer, closest.latlng);
     },
@@ -89,13 +111,13 @@ L.Handler.MarkerSnap = L.Handler.extend({
             marker.update();
             if (marker.snap != layer) {
                 marker.snap = layer;
-                if (marker._icon) L.DomUtil.addClass(marker._icon, 'marker-snapped');
+                L.DomUtil.addClass(marker._icon, 'marker-snapped');
                 marker.fire('snap', {layer:layer, latlng: latlng});
             }
         }
         else {
             if (marker.snap) {
-                if (marker._icon) L.DomUtil.removeClass(marker._icon, 'marker-snapped');
+                L.DomUtil.removeClass(marker._icon, 'marker-snapped');
                 marker.fire('unsnap', {layer:marker.snap});
             }
             delete marker['snap'];
@@ -104,14 +126,17 @@ L.Handler.MarkerSnap = L.Handler.extend({
 });
 
 
-L.Edit = L.Edit || {};
-L.Edit.Poly = L.Edit.Poly || {};
+if (!L.Edit.Poly) {
+    // Leaflet.Draw not available.
+    return;
+}
+
 
 L.Handler.PolylineSnap = L.Edit.Poly.extend({
 
     initialize: function (map, poly, options) {
         L.Edit.Poly.prototype.initialize.call(this, poly, options);
-        this._snapper = new L.Handler.MarkerSnap(map);
+        this._snapper = new L.Handler.MarkerSnap(map, options);
     },
 
     addGuideLayer: function (layer) {
@@ -122,7 +147,7 @@ L.Handler.PolylineSnap = L.Edit.Poly.extend({
         var marker = L.Edit.Poly.prototype._createMarker.call(this, latlng, index);
 
         // Treat middle markers differently
-        var isMiddle = arguments.callee.caller.toString().indexOf('_getMiddleLatLng') != -1;
+        var isMiddle = index === undefined;
         if (isMiddle) {
             // Snap middle markers, only once they were touched
             marker.on('dragstart', function () {
@@ -136,3 +161,69 @@ L.Handler.PolylineSnap = L.Edit.Poly.extend({
     }
 });
 
+
+L.Draw.Feature.SnapMixin = {
+    _snap_initialize: function () {
+        this.on('enabled', this._snap_on_enabled, this);
+        this.on('disabled', this._snap_on_disabled, this);
+    },
+
+    _snap_on_enabled: function () {
+        if (!this.options.guideLayers) {
+            return;
+        }
+
+        if (!this._mouseMarker) {
+            return;
+        }
+
+        if (!this._snapper) {
+            this._snapper = new L.Handler.MarkerSnap(this._map);
+            if (this.options.snapDistance) {
+                this._snapper.options.snapDistance = this.options.snapDistance;
+            }
+            if (this.options.snapVertices) {
+                this._snapper.options.snapVertices = this.options.snapVertices;
+            }
+        }
+
+        for (var i=0, n=this.options.guideLayers.length; i<n; i++)
+            this._snapper.addGuideLayer(this.options.guideLayers[i]);
+
+        var marker = this._mouseMarker;
+
+        this._snapper.watchMarker(marker);
+
+        // Show marker when (snap for user feedback)
+        var icon = marker.options.icon;
+        marker.on('snap', function (e) {
+                  marker.setIcon(this.options.icon);
+                  marker.setOpacity(1);
+              }, this)
+              .on('unsnap', function (e) {
+                  marker.setIcon(icon);
+                  marker.setOpacity(0);
+              }, this);
+
+        marker.on('click', this._snap_on_click, this);
+    },
+
+    _snap_on_click: function () {
+        if (this._markers) {
+            var markerCount = this._markers.length,
+                marker = this._markers[markerCount - 1];
+            if (this._mouseMarker.snap) {
+                L.DomUtil.addClass(marker._icon, 'marker-snapped');
+            }
+        }
+    },
+
+    _snap_on_disabled: function () {
+        delete this._snapper;
+    },
+};
+
+L.Draw.Feature.include(L.Draw.Feature.SnapMixin);
+L.Draw.Feature.addInitHook('_snap_initialize');
+
+})();
