@@ -25,7 +25,7 @@ def get_internal_user():
             internal_user.is_active = False
             internal_user.is_staff = False
             internal_user.save()
-            get_internal_user.instance = internal_user
+        get_internal_user.instance = internal_user
     return get_internal_user.instance
 
 
