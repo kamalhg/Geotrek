@@ -5,7 +5,9 @@ CHANGELOG
 0.28.9dev (unreleased)
 -------------------
 
-*
+**Bug fixes**
+
+* Fix logs rotation
 
 
 0.28.8 (2014-12-22)
